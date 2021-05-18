@@ -36,10 +36,7 @@ class CDI_Experiment :
         self.det = sk.PnccdDetector(geom=geom_path)
         
         self.n_images, self.n_panels, self.d_panel, _ = self.data['intensities'].shape
-
         self.d, self.d_slit = self.det.assemble_image_stack(self.data['intensities'][0]).shape
-        self.det_mask = np.full(self.d_slit, True)
-        self.det_mask[self.d_panel:(self.d_panel + self.d_slit - self.d)] = np.full(self.d_slit - self.d, False)
         
         self.plot_dir = plot_dir
         check_create(self.plot_dir)
@@ -48,13 +45,14 @@ class CDI_Experiment :
     # Data processing functions
     
     
-    def init_iPCA(n_batches, n_comp, sub_ratio) :
+    def init_iPCA(n_batches, n_comp, d_crop, sub_ratio) :
         """
         Initializes an incremental PCA
         
         :param n_batches: number of batches to divide data into
         :param n_comp: number of components to keep in the iPCA
-        :param sub_ratio: sub_sampling ratio of data. A ratio of 1 means that no subsampling is applied
+        :param d_crop: dimension to crop images into
+        :param sub_ratio: sub_sampling ratio of data after cropping. A ratio of 1 means that no subsampling is applied
         """
         
         self.n_batches = n_batches
@@ -63,11 +61,20 @@ class CDI_Experiment :
 
         self.n_comp = n_comp
 
+        self.d_crop = d_crop
         self.sub_ratio = sub_ratio
-        self.sub_d = self.d // self.sub_ratio
-
+        self.sub_d = self.d_crop // self.sub_ratio
         self.sub_index = self.sub_ratio * np.arange(self.sub_d)
-        
+        sub_row = np.full(self.d_crop, False)
+        sub_row[self.sub_index] = True
+
+        crop_mask = np.full((self.d_crop, self.d_crop), False)
+        crop_mask[self.sub_index, :] = sub_row
+        det_mask = np.full((self.d, self.d), False)
+        det_mask[(self.d - self.d_crop) // 2:(self.d + self.d_crop) // 2, (self.d - self.d_crop) // 2:(self.d + self.d_crop) // 2] = crop_mask
+        slit_mask = np.full((self.d, self.d_slit - self.d), False)
+        self.det_mask = np.concatenate((det_mask[:, :self.d_panel], slit_mask, det_mask[:, self.d_panel:]), axis=1)
+
         self.pca = IncrementalPCA(n_components=self.n_comp)
         self.coordinates = []
         
@@ -78,8 +85,8 @@ class CDI_Experiment :
         """
         
         for index in tqdm(self.batch_index) :
-            batch = self.det.assemble_image_stack_batch(self.data['intensities'][index])[:, :, self.det_mask][:, self.sub_index][:,:, self.sub_index]
-            self.pca.partial_fit(batch.reshape(self.batch_size, self.sub_d ** 2))
+            batch = self.det.assemble_image_stack_batch(self.data['intensities'][index])[:, self.det_mask]
+            self.pca.partial_fit(batch)
         
         self.eigenimages = self.pca.components_.reshape(self.n_comp, self.sub_d, self.sub_d)
         return
@@ -91,7 +98,7 @@ class CDI_Experiment :
         """
         
         for index in tqdm(batch_index) :
-            batch_coord = self.pca.transform(self.det.assemble_image_stack_batch(self.data['intensities'][index])[:, :, self.det_mask][:, self.sub_index][:, :, self.sub_index].reshape(self.batch_size, self.sub_d ** 2))
+            batch_coord = self.pca.transform(self.det.assemble_image_stack_batch(self.data['intensities'][index])[ :, self.det_mask])
             self.coordinates.append(batch_coord)
 
         self.coordinates = np.concatenate(self.coordinates)
@@ -289,7 +296,7 @@ class CDI_Experiment :
         fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(15, 15*(nrows//ncols)))
         for i in range(n_samples):
             idx = samples[i]
-            image = self.det.assemble_image_stack(self.data['intensities'][idx])[:, self.det_mask][self.sub_index][:, self.sub_index]
+            image = self.det.assemble_image_stack(self.data['intensities'][idx])[self.det_mask].reshape(self.sub_d, self.sub_d)
             fullr = self.full_reconstruct[idx]
             partialr = self.partial_reconstruct[idx]
             axs[i,0].imshow(image, norm=LogNorm(), interpolation='none')
@@ -326,11 +333,11 @@ class CDI_Experiment :
         - the original image corresponding to point k_bin
         
         :param b: numpy array which indexes points belonging to a certain bin
-        :param k_bin: index of the point to consider. Points of a bin are indexed in increasing order of argument as
-        computed when binning
+        :param k_bin: index of the point to consider. Points of a bin are indexed in increasing order of argument (as
+        computed when binning)
         """
         true_index = np.arange(n_images)[b][k_bin]
-        image = self.det.assemble_image_stack(self.data['intensities'][true_index])[:, self.det_mask][self.sub_index][:, self.sub_index]
+        image = self.det.assemble_image_stack(self.data['intensities'][true_index])[self.det_mask].reshape(self.sub_d, self.sub_d)
         k_mask = (np.arange(b.sum()) == k_bin)
         not_k_mask = np.logical_not(k_mask)
 
@@ -350,7 +357,7 @@ class CDI_Experiment :
     def bin_lap_gif(b_idx, n_frames) :
         """
         Creates and saves a GIF animation of frames created using BinImagePlot when going through a bin in increasing
-        order of argument as computed when binning
+        order of argument (as computed when binning)
         
         :param b_idx: index of bin to consider
         :param n_frames: number of frames of the gif
