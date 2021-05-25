@@ -22,7 +22,7 @@ from utils import *
 
 class CDI_Experiment :
     
-    def __init__(self, data_path, plot_dir, geom_path):
+    def __init__(self, data_path, plot_dir, geom_path, intensities=True):
         """
         Initializes an instance of the CDI_Experiment class
         
@@ -35,8 +35,18 @@ class CDI_Experiment :
         self.data = h5py.File(self.data_path, 'r')
         self.det = sk.PnccdDetector(geom=geom_path)
         
-        self.n_images, self.n_panels, self.d_panel, _ = self.data['intensities'].shape
-        self.d, self.d_slit = self.det.assemble_image_stack(self.data['intensities'][0]).shape
+        keys = list(self.data.keys())
+        if intensities :
+            self.key = 'intensities'
+            if not self.key in keys :
+                raise Exception('This dataset does not have an intensities key, try again with intensities=False.')
+        else :
+            self.key = 'photons'
+            if not self.key in keys :
+                raise Exception('This dataset does not have a photons key, try again with intensities=True.')
+        
+        self.n_images, self.n_panels, self.panel_dim, _ = self.data[self.key].shape
+        self.no_slit_dim, self.slit_dim = self.det.assemble_image_stack(self.data[self.key][0]).shape # One side of the images has a slit, which makes the dimensions of the images different
         
         self.plot_dir = plot_dir
         check_create(self.plot_dir)
@@ -45,14 +55,15 @@ class CDI_Experiment :
     # Data processing functions
     
     
-    def init_iPCA(n_batches, n_comp, d_crop, sub_ratio) :
+    def init_iPCA(n_batches, n_comp, crop_dim, sub_ratio) :
         """
         Initializes an incremental PCA
         
         :param n_batches: number of batches to divide data into
         :param n_comp: number of components to keep in the iPCA
-        :param d_crop: dimension to crop images into
-        :param sub_ratio: sub_sampling ratio of data after cropping. A ratio of 1 means that no subsampling is applied
+        :param crop_dim: dimension to crop images into
+        :param sub_ratio: sub_sampling ratio of data after cropping : on each column and row, we only keep one in
+        sub_ratio pixels. 
         """
         
         self.n_batches = n_batches
@@ -61,19 +72,19 @@ class CDI_Experiment :
 
         self.n_comp = n_comp
 
-        self.d_crop = d_crop
+        self.crop_dim = crop_dim
         self.sub_ratio = sub_ratio
-        self.sub_d = self.d_crop // self.sub_ratio
-        self.sub_index = self.sub_ratio * np.arange(self.sub_d)
-        sub_row = np.full(self.d_crop, False)
+        self.sub_dim = self.crop_dim // self.sub_ratio
+        self.sub_index = self.sub_ratio * np.arange(self.sub_dim)
+        sub_row = np.full(self.crop_dim, False)
         sub_row[self.sub_index] = True
 
-        crop_mask = np.full((self.d_crop, self.d_crop), False)
+        crop_mask = np.full((self.crop_dim, self.crop_dim), False)
         crop_mask[self.sub_index, :] = sub_row
-        det_mask = np.full((self.d, self.d), False)
-        det_mask[(self.d - self.d_crop) // 2:(self.d + self.d_crop) // 2, (self.d - self.d_crop) // 2:(self.d + self.d_crop) // 2] = crop_mask
-        slit_mask = np.full((self.d, self.d_slit - self.d), False)
-        self.det_mask = np.concatenate((det_mask[:, :self.d_panel], slit_mask, det_mask[:, self.d_panel:]), axis=1)
+        det_mask = np.full((self.no_slit_dim, self.no_slit_dim), False)
+        det_mask[(self.no_slit_dim - self.crop_dim) // 2:(self.no_slit_dim + self.crop_dim) // 2, (self.no_slit_dim - self.crop_dim) // 2:(self.no_slit_dim + self.crop_dim) // 2] = crop_mask
+        slit_mask = np.full((self.no_slit_dim, self.slit_dim - self.no_slit_dim), False)
+        self.det_mask = np.concatenate((det_mask[:, :self.panel_dim], slit_mask, det_mask[:, self.panel_dim:]), axis=1)
 
         self.pca = IncrementalPCA(n_components=self.n_comp)
         self.coordinates = []
@@ -85,10 +96,10 @@ class CDI_Experiment :
         """
         
         for index in tqdm(self.batch_index) :
-            batch = self.det.assemble_image_stack_batch(self.data['intensities'][index])[:, self.det_mask]
+            batch = self.det.assemble_image_stack_batch(self.data[self.key][index])[:, self.det_mask]
             self.pca.partial_fit(batch)
         
-        self.eigenimages = self.pca.components_.reshape(self.n_comp, self.sub_d, self.sub_d)
+        self.eigenimages = self.pca.components_.reshape(self.n_comp, self.sub_dim, self.sub_dim)
         return
     
     
@@ -98,7 +109,7 @@ class CDI_Experiment :
         """
         
         for index in tqdm(batch_index) :
-            batch_coord = self.pca.transform(self.det.assemble_image_stack_batch(self.data['intensities'][index])[ :, self.det_mask])
+            batch_coord = self.pca.transform(self.det.assemble_image_stack_batch(self.data[self.key][index])[ :, self.det_mask])
             self.coordinates.append(batch_coord)
 
         self.coordinates = np.concatenate(self.coordinates)
@@ -147,40 +158,54 @@ class CDI_Experiment :
         
         :param n_partial: number of components of the iPCA to consider when computing the partial reconstruction
         """
-
-        self.full_reconstruct = self.pca.inverse_transform(self.coordinates).reshape(self.n_images, self.sub_d, self.sub_d)
-        self.partial_reconstruct = (np.dot(self.coordinates[:, :n_partial], self.pca.components_[:n_partial]) + self.pca.mean_).reshape(self.n_images, self.sub_d, self.sub_d)
+        
+        self.n_partial = min(n_partial, self.n_comp)
+        self.full_reconstruct = self.pca.inverse_transform(self.coordinates).reshape(self.n_images, self.sub_dim, self.sub_dim)
+        self.partial_reconstruct = (np.dot(self.coordinates[:, :self.n_partial], self.pca.components_[:self.n_partial]) + self.pca.mean_).reshape(self.n_images, self.sub_dim, self.sub_dim)
         return
 
     
-    def ica(n_comp=2, random_state=92) :
+    def ica(n_comp=2, ica_slice=(1, 3), random_state=92) :
         """
-        Applies ICA to the PCA-transformed dataset in order to straighten the shape of its first three components.
-        This makes binning easier.
+        Applies ICA to the PCA-transformed dataset in order to straighten the shape of its components. This makes
+        binning easier.
         
         :param n_comp: number of components of the ICA
+        :param ica_slice: slice of components from the PCA-transformed dataset to consider
         """
         
-        ica_ = FastICA(n_components=n_comp, random_state=random_state)
-        self.ica_coordinates = ica_.fit_transform(self.coordinates[:, 1:3])
+        self.ica_n_comp = n_comp
+        ica_ = FastICA(n_components=self.ica_n_comp, random_state=random_state)
+        
+        self.ica_slice = ica_slice
+        self.ica_coordinates = ica_.fit_transform(self.coordinates[:, self.ica_slice[0]:self.ica_slice[1]])
         return
     
     
-    def binning(n_bins) :
+    def binning(binning_comp=1, n_bins=10, bin_ica=True) :
         """
-        Binning of the shape created by the first three components of the ICA-PCA-transformed dataset. We bin by increasing
-        order of the third component of the ICA. We also compute in each bin the angle between the rotation axes associated
-        with each of its points and its center axis as defined in notebook cdi_process.ipynb.
+        Binning of the shape created by the first ica_n_partial components of the ICA-PCA-transformed dataset. We bin
+        by increasing order of the binning_comp component of the ICA. We also compute in each bin the angle between the
+        rotation axes associated with each of its points and its center axis as defined in notebook cdi_process.ipynb.
         
+        :param binning_comp: component according to which the ICA-PCA-transformed dataset should be sorted and binned
         :param n_bins: number of bins to divide the dataset into
+        :param bin_ica: if False, we ignore the ICA and bin only according to PCA components
         """
         
         # Initializes binning
+        self.binning_comp = binning_comp
         self.n_bins = n_bins
-        min_bin = self.ica_coordinates[:, 1].min()
-        max_bin = self.ica_coordinates[:, 1].max()
+        
+        if bin_ica :
+            binning_coordinates = self.ica_coordinates
+        else :
+            binning_coordinates = self.coordinates
+            
+        min_bin = binning_coordinates[:, self.binning_comp].min()
+        max_bin = binning_coordinates[:, self.binning_comp].max()
         bins = np.linspace(min_bin, max_bin, n_bins + 1)
-        self.bin_indexes = np.array([(self.ica_coordinates[:, 1] >= self.bins[i]) * (self.ica_coordinates[:, 1] < self.bins[i + 1]) for i in range(self.n_bins)])
+        self.bin_indexes = np.array([(binning_coordinates[:, self.binning_comp] >= bins[i]) * (binning_coordinates[:, self.binning_comp] < bins[i + 1]) for i in range(self.n_bins)])
         
         # Computes correlations and angles among each pair of point in each bin
         self.cors = [bin_cor(b) for b in self.bin_indexes]
@@ -296,7 +321,7 @@ class CDI_Experiment :
         fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(15, 15*(nrows//ncols)))
         for i in range(n_samples):
             idx = samples[i]
-            image = self.det.assemble_image_stack(self.data['intensities'][idx])[self.det_mask].reshape(self.sub_d, self.sub_d)
+            image = self.det.assemble_image_stack(self.data[self.key][idx])[self.det_mask].reshape(self.sub_dim, self.sub_dim)
             fullr = self.full_reconstruct[idx]
             partialr = self.partial_reconstruct[idx]
             axs[i,0].imshow(image, norm=LogNorm(), interpolation='none')
@@ -337,7 +362,7 @@ class CDI_Experiment :
         computed when binning)
         """
         true_index = np.arange(n_images)[b][k_bin]
-        image = self.det.assemble_image_stack(self.data['intensities'][true_index])[self.det_mask].reshape(self.sub_d, self.sub_d)
+        image = self.det.assemble_image_stack(self.data[self.key][true_index])[self.det_mask].reshape(self.sub_dim, self.sub_dim)
         k_mask = (np.arange(b.sum()) == k_bin)
         not_k_mask = np.logical_not(k_mask)
 
